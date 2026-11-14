@@ -498,6 +498,18 @@ void thr_dump(void)
         rt_log("  live: %d handles, %d mutex/event, %d thread slots (%d running), %d sound buffers, %d palettes, %d gdi objects, %d windows\n",
                gh_live(), ns, nt, nl, ds_live_buffers(), gpal_live(), gdi_live(), wnd_live());
     }
+    {   /* DUMPBIN=addr:len[,addr:len]: raw guest memory to dump_<addr>.bin next to the exe */
+        const char *b = getenv(ENV("DUMPBIN"));
+        while (b && *b) {
+            u32 a = (u32)strtoul(b, (char **)&b, 16), n = 0x10000;
+            if (*b == ':') n = (u32)strtoul(b + 1, (char **)&b, 16);
+            char p[600];
+            snprintf(p, sizeof p, "%s\\dump_%08x.bin", rt_exe_dir, a);
+            FILE *f = fopen(p, "wb");
+            if (f) { fwrite(MEM + a, 1, n, f); fclose(f); }
+            if (*b == ',') b++; else break;
+        }
+    }
     const char *m = getenv(ENV("DUMPMEM"));
     while (m && *m) {
         u32 a = (u32)strtoul(m, (char **)&m, 16), n = 64;

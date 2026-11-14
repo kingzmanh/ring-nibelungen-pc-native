@@ -19,3 +19,4 @@ graphify-out/
 testroot/
 prof.txt
 __pycache__/
+*.bin

@@ -1,6 +1,6 @@
 """Builds the dev game folders from the extracted discs (hardlinks, no copies):
   game/hd = what the game's installer (install.exe, eng.lis) puts on the hard disk
-  game/cd = all four CDs merged (data/cd.ini is answered by the runtime)
+  game/cd = all four CDs merged (disc 1's data/cd.ini; the disc check: src/rt/ring_game.c)
 usage: python tools/mkgame.py <original dir with disc1..disc4> [lang=eng]"""
 import os, sys, fnmatch, shutil
 
@@ -74,8 +74,8 @@ def main():
         for base, dirs, files in os.walk(dd):
             for f in files:
                 rel = os.path.relpath(os.path.join(base, f), dd).lower()
-                if rel == os.path.join('data', 'cd.ini'):
-                    continue
+                if rel == os.path.join('data', 'cd.ini') and i != 1:
+                    continue                 # disc 1's "1" answers for all (src/rt/ring_game.c)
                 link(os.path.join(base, f), os.path.join(cd, rel))
                 m += 1
     print('cd: %d files' % m)

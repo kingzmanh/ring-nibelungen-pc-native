@@ -13,10 +13,6 @@ void path_to_host(const char *p, char *out, size_t n);
 u32 gh_new(int kind, HANDLE h);
 GH *gh_get(u32 h);
 
-/* the CD's data\cd.ini says which of the four discs it is; the four are one
-   folder here, so the answer is always the disc the game is asking for */
-int ring_cd_wanted = 1;
-
 static HANDLE open_host(const char *g, u32 style, char *hp, size_t n)
 {
     path_to_host(g, hp, n);

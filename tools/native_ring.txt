@@ -1,1 +1,3 @@
 # hand-written natives: <addr> <C name> [wrap = the original stays callable]
+# disc check: all four CDs are one folder (src/rt/ring_game.c)
+439b60 N_zone_cd wrap
