@@ -1,5 +1,5 @@
-/* The install itself: copies the user's two game CDs (they are then always
- * "in the drive"), lays out what the original installer put on the hard
+/* The install itself: copies the user's four game CDs into one folder (they
+ * are then all always "in the drive", so the game never asks for a disc), lays out what the original installer put on the hard
  * disk, and puts the PC executable in place with the game's own icon. */
 #include "setup.h"
 #include <stdlib.h>
@@ -240,9 +240,9 @@ void shortcut_paths(char *startmenu, char *desktop)
 {
     char p[MAX_PATH];
     SHGetFolderPathA(NULL, CSIDL_PROGRAMS, NULL, 0, p);
-    snprintf(startmenu, MAX_PATH * 2, "%s\\%s.lnk", p, GAME_TITLE);
+    snprintf(startmenu, MAX_PATH * 2, "%s\\%s.lnk", p, GAME_TITLE_FS);
     SHGetFolderPathA(NULL, CSIDL_DESKTOPDIRECTORY, NULL, 0, p);
-    snprintf(desktop, MAX_PATH * 2, "%s\\%s.lnk", p, GAME_TITLE);
+    snprintf(desktop, MAX_PATH * 2, "%s\\%s.lnk", p, GAME_TITLE_FS);
 }
 
 static void register_uninstall(const char *dir, u64 bytes)
@@ -283,34 +283,42 @@ int do_install(const InstallOpts *o, void (*cb)(u64, u64, void *), void *user)
     char p[MAX_PATH * 2], game[MAX_PATH * 2], hd[MAX_PATH * 2], cd[MAX_PATH * 2];
     setup_log("Install to %s", o->dir);
     if (!prebuilt_available()) return fail("this setup does not contain the game executable");
-    CdSrc *c = cd_open(o->cd);
-    if (!c) return fail("disc 1 is not a readable disc, image or folder");
-    if (!game_is_cd(c)) { cd_close(c); return fail("this is not disc 1 of " GAME_TITLE); }
-    CdSrc *c2 = cd_open(o->cd2);
-    if (!c2) { cd_close(c); return fail("disc 2 is not a readable disc, image or folder"); }
-    if (!game_is_cd2(c2)) { cd_close(c); cd_close(c2); return fail("this is not disc 2 of " GAME_TITLE); }
-
+    CdSrc *c[GAME_DISCS] = {0};
+    char msg[160];
     Progress pr = {0};
     pr.cb = cb;
     pr.user = user;
-    pr.total = cd_total_bytes(c) + cd_total_bytes(c2) + (8ull << 20);
+    pr.total = 8ull << 20;
+    for (int n = 0; n < GAME_DISCS; n++) {
+        c[n] = cd_open(o->cd[n]);
+        if (!c[n] || !game_is_disc(c[n], n)) {
+            snprintf(msg, sizeof msg, c[n] ? "this is not disc %d of " GAME_TITLE : "disc %d is not a readable disc, image or folder", n + 1);
+            for (int k = 0; k <= n; k++) if (c[k]) cd_close(c[k]);
+            return fail(msg);
+        }
+        pr.total += cd_total_bytes(c[n]);
+    }
     u64 bytes = pr.total + (12ull << 20);
 
     snprintf(game, sizeof game, "%s\\game", o->dir);
     snprintf(hd, sizeof hd, "%s\\hd", game);
     snprintf(cd, sizeof cd, "%s\\cd", game);
-    if (!make_dirs(hd)) { cd_close(c); cd_close(c2); return fail("cannot create the install folder"); }
+    if (!make_dirs(hd)) { for (int n = 0; n < GAME_DISCS; n++) cd_close(c[n]); return fail("cannot create the install folder"); }
 
-    /* 1. the discs: drive D: of the game, both always in the drive (disc 2
-       holds only GENS, merged into disc 1's) */
-    setup_log("Copying disc 1: %s ...", cd_describe(c));
-    if (!cd_copy_all(c, cd, &pr)) { cd_close(c); cd_close(c2); return fail("copying disc 1 failed"); }
-    cd_close(c);
-    setup_log("Copying disc 2: %s ...", cd_describe(c2));
-    if (!cd_copy_all(c2, cd, &pr)) { cd_close(c2); return fail("copying disc 2 failed"); }
-    cd_close(c2);
+    /* 1. the discs: all four merged into drive D: of the game */
+    for (int n = 0; n < GAME_DISCS; n++) {
+        setup_log("Copying disc %d: %s ...", n + 1, cd_describe(c[n]));
+        int ok = cd_copy_all(c[n], cd, &pr);
+        cd_close(c[n]);
+        c[n] = NULL;
+        if (!ok) {
+            for (int k = n + 1; k < GAME_DISCS; k++) cd_close(c[k]);
+            snprintf(msg, sizeof msg, "copying disc %d failed", n + 1);
+            return fail(msg);
+        }
+    }
 
-    /* 2. what the DOS installer put on the hard disk (game_install.c) */
+    /* 2. what the game's own installer put on the hard disk (game_install.c) */
     setup_log("Setting up the game files ...");
     if (!game_install_files(cd, hd)) return 0;
     progress_add(&pr, 6ull << 20);
