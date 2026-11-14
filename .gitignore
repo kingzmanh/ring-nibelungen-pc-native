@@ -21,3 +21,5 @@ prof.txt
 __pycache__/
 *.bin
 comparison/
+record_ffmpeg.log
+*.mp4

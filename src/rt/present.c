@@ -499,6 +499,8 @@ int present_rgb(const u32 *pix, int sw, int sh)
     IDirect3DSurface9_Release(bb);
     RECT sr = {0, 0, (LONG)cw, (LONG)ch};
     IDirect3DDevice9_Present(dev, &sr, NULL, NULL, NULL);
+    void present_record(void);
+    present_record();
     return 1;
 }
 
@@ -768,4 +770,84 @@ void present_shot(const char *path)
     }
     if (sys) IDirect3DSurface9_Release(sys);
     IDirect3DSurface9_Release(bb);
+}
+
+/* test recording: RING_RECORD=<file.mp4 next to the exe>, RING_RECORD_FROM=ms,
+   RING_RECORD_MS=ms - the presented picture at a steady 30 fps, piped to ffmpeg */
+void present_record(void)
+{
+    static int state;               /* 0 not started, 1 recording, 2 done / off */
+    static HANDLE pipe_w, proc;
+    static u32 next_t, end_t;
+    static int rw, rh;
+    static IDirect3DSurface9 *sys;
+    static u8 *buf;
+    if (state == 2) return;
+    const char *file = getenv(ENV("RECORD"));
+    if (!file) { state = 2; return; }
+    extern u32 win_time(void);
+    u32 t = win_time();
+    if (state == 0) {
+        u32 from = getenv(ENV("RECORD_FROM")) ? (u32)atoi(getenv(ENV("RECORD_FROM"))) : 0;
+        if (t < from) return;
+        RECT cr;
+        GetClientRect(hwnd, &cr);
+        rw = cr.right & ~1; rh = cr.bottom & ~1;
+        char cmd[1200];
+        snprintf(cmd, sizeof cmd, "ffmpeg -y -loglevel error -f rawvideo -pix_fmt bgra -s %dx%d -r 30 -i - "
+                 "-c:v libx264 -crf 14 -preset medium -pix_fmt yuv420p \"%s\\%s\"", rw, rh, rt_exe_dir, file);
+        /* ffmpeg as a hidden child process reading our pipe (no console window) */
+        SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
+        HANDLE rd;
+        if (!CreatePipe(&rd, &pipe_w, &sa, 1 << 22)) { state = 2; return; }
+        SetHandleInformation(pipe_w, HANDLE_FLAG_INHERIT, 0);
+        STARTUPINFOA si = { sizeof si };
+        si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        si.hStdInput = rd;
+        char lp[700];
+        snprintf(lp, sizeof lp, "%s\\record_ffmpeg.log", rt_exe_dir);
+        HANDLE lf = CreateFileA(lp, GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        si.hStdOutput = si.hStdError = lf;
+        rt_log("record: %s\n", cmd);
+        PROCESS_INFORMATION pi;
+        if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            rt_log("record: cannot start ffmpeg (%lu)\n", GetLastError());
+            CloseHandle(rd); CloseHandle(pipe_w); state = 2; return;
+        }
+        CloseHandle(rd);
+        CloseHandle(pi.hThread);
+        proc = pi.hProcess;
+        buf = malloc((size_t)rw * rh * 4);
+        next_t = from;
+        end_t = from + (getenv(ENV("RECORD_MS")) ? (u32)atoi(getenv(ENV("RECORD_MS"))) : 10000);
+        state = 1;
+        rt_log("record: %dx%d to %s\n", rw, rh, file);
+    }
+    if (t < next_t) return;
+    IDirect3DSurface9 *bb = NULL;
+    if (FAILED(IDirect3DDevice9_GetBackBuffer(dev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
+    if (!sys) IDirect3DDevice9_CreateOffscreenPlainSurface(dev, pp.BackBufferWidth, pp.BackBufferHeight, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &sys, NULL);
+    D3DLOCKED_RECT lr;
+    if (sys && SUCCEEDED(IDirect3DDevice9_GetRenderTargetData(dev, bb, sys)) && SUCCEEDED(IDirect3DSurface9_LockRect(sys, &lr, NULL, D3DLOCK_READONLY))) {
+        for (int y = 0; y < rh; y++) {
+            memcpy(buf + (size_t)y * rw * 4, (const u8 *)lr.pBits + y * lr.Pitch, (size_t)rw * 4);
+            for (int x = 0; x < rw; x++) buf[((size_t)y * rw + x) * 4 + 3] = 255;
+        }
+        IDirect3DSurface9_UnlockRect(sys);
+        /* the same picture for every 1/30 s slot that has passed */
+        while (t >= next_t && next_t < end_t) {
+            DWORD put;
+            WriteFile(pipe_w, buf, (DWORD)((size_t)rw * rh * 4), &put, NULL);
+            next_t += 33 + ((next_t / 33) % 3 == 0);
+        }
+    }
+    IDirect3DSurface9_Release(bb);
+    if (next_t >= end_t) {
+        CloseHandle(pipe_w);
+        WaitForSingleObject(proc, 30000);
+        CloseHandle(proc);
+        state = 2;
+        rt_log("record: done\n");
+    }
 }

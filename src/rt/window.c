@@ -261,7 +261,9 @@ static void frame_done(void)
     frames++;
     u32 t = now_ms() - t0;
     while (shot_next < nshots && t >= shots[shot_next]) { save_shot(shots[shot_next]); shot_next++; }
-    if (hwnd && !hidden && !IsIconic(hwnd)) {
+    static int recording = -1;   /* RECORD test runs present while hidden (present.c records the picture) */
+    if (recording < 0) recording = getenv(ENV("RECORD")) != NULL;
+    if (hwnd && (!hidden || recording) && !IsIconic(hwnd)) {
         if (!(d3d_ok && present_rgb(frame, fw, fh))) {
             HDC dc = GetDC(hwnd);
             paint(dc);
