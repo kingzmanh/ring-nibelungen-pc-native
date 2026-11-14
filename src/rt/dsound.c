@@ -39,6 +39,7 @@ static Buf *bufs[MAXB];
 static u32 vt_ds, vt_buf, vt_notify, obj_ds;
 static SDL_AudioDeviceID dev;
 static int muted;
+static volatile int nf_any;      /* a notify bit is waiting (skip the scan otherwise) */
 
 static Buf *B(u32 obj) { u32 i = RD32(obj + 4); return (i < MAXB && bufs[i] && bufs[i]->obj == obj) ? bufs[i] : NULL; }
 
@@ -78,7 +79,7 @@ static void mix(void *ud, Uint8 *stream, int len)
                 if (b->looping) { b->pos -= frames; f = (u32)b->pos; if (f >= frames) { b->pos = 0; f = 0; } }
                 else {
                     b->playing = 0; b->pos = 0;
-                    for (int j = 0; j < b->nnotify; j++) if (b->nf_off[j] == 0xffffffffu) b->nf_pending |= 1u << j;
+                    for (int j = 0; j < b->nnotify; j++) if (b->nf_off[j] == 0xffffffffu) { b->nf_pending |= 1u << j; nf_any = 1; }
                     break;
                 }
             }
@@ -98,7 +99,7 @@ static void mix(void *ud, Uint8 *stream, int len)
                 u32 o = b->nf_off[j];
                 if (o == 0xffffffffu) continue;
                 u32 d = (o + b->size - start_byte) % b->size;
-                if (adv && d < adv) b->nf_pending |= 1u << j;
+                if (adv && d < adv) { b->nf_pending |= 1u << j; nf_any = 1; }
             }
         }
     }
@@ -227,6 +228,8 @@ static void n_SetNotificationPositions(void)
 void dsound_notify_poll(void)
 {
     void thr_signal(u32 h);
+    if (!nf_any) return;
+    nf_any = 0;
     for (int i = 0; i < MAXB; i++) {
         Buf *b = bufs[i];
         if (!b || !b->nf_pending) continue;

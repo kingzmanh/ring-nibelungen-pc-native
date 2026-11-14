@@ -72,8 +72,13 @@ static void present_now(void)
     present_pending = 0;
     last_present = now_ms();
     if (!primary) return;
-    if (primary->bpp == 16) present_frame16(MEM + primary->mem, primary->pitch, primary->w, primary->h);
+    if (primary->bpp == 16) {
+        void pano_compose(u32 mem, int pitch);
+        pano_compose(primary->mem, primary->pitch);   /* hires_pano.c */
+        present_frame16(MEM + primary->mem, primary->pitch, primary->w, primary->h);
+    }
     else {
+        hires_layer.valid = 0;
         if (primary->pal) memcpy(cur_pal, primary->pal->rgb, sizeof cur_pal);
         present_frame(MEM + primary->mem, primary->pitch, cur_pal);
     }

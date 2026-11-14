@@ -1,3 +1,6 @@
 # hand-written natives: <addr> <C name> [wrap = the original stays callable]
 # disc check: all four CDs are one folder (src/rt/ring_game.c)
 439b60 N_zone_cd wrap
+# panorama internal resolution (src/rt/hires_pano.c)
+412220 N_pano_frame wrap
+4116d0 N_pano_block wrap
