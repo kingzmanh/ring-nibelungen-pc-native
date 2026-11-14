@@ -22,7 +22,8 @@ int opt_fullscreen = 1, opt_filter = 5, opt_sharpen = 1, opt_fxaa = 0, opt_aspec
 int opt_scale = 0;
 int opt_moviecolor = 1;
 int opt_moviefull = 1;    /* (unused in Ring: its movies are 640x448 in the 640x480 screen) */
-int opt_moviedeblock = 1, opt_moviedeband = 1;   /* movie_hq.c clean-up of the decoded frames */
+int opt_moviedeblock = 1, opt_moviedeband = 1;
+int opt_panosharp = 1;    /* panoramas: sharp bicubic sampling (0 = smooth bilinear) */   /* movie_hq.c clean-up of the decoded frames */
 int opt_render = 4;       /* internal resolution of the live 3D (1 = original) */   /* movies from the decoder in 24-bit colour instead of the game's 16-bit copy */
 static char ini_path[700];
 static HWND hwnd;
@@ -36,7 +37,7 @@ static int ov_w, ov_h;
 static IDirect3DSurface9 *aa_surf, *up_surf;
 static UINT up_w, up_h;
 static IDirect3DVertexShader9 *vs_blit;
-static IDirect3DPixelShader9 *ps_alpha, *ps_copy, *ps_bicubic, *ps_sharpbil, *ps_fxaa, *ps_sharpen, *ps_over, *ps_xbr, *ps_easu;
+static IDirect3DPixelShader9 *ps_alpha, *ps_copy, *ps_bicubic, *ps_sharpbil, *ps_fxaa, *ps_sharpen, *ps_over, *ps_xbr, *ps_easu, *ps_alpha_sharp;
 static IDirect3DVertexDeclaration9 *blit_decl;
 static int d3d_ok;
 
@@ -193,6 +194,24 @@ static const char *PS_OVER =
 static const char *PS_ALPHA =
     "sampler2D s : register(s0);"
     "float4 main(float2 t : TEXCOORD0) : COLOR { return tex2D(s, t); }";
+/* the N x layer with contrast-adaptive sharpening at screen resolution
+   (ts.zw = one output pixel); texels at the layer's edges are left alone */
+static const char *PS_ALPHA_SHARPEN =
+    "sampler2D s : register(s0);\n"
+    "float4 ts : register(c1);\n"
+    "float4 k : register(c2);\n"
+    "float4 main(float2 uv : TEXCOORD0) : COLOR {\n"
+    "  float2 d = ts.zw;\n"
+    "  float4 c = tex2D(s, uv);\n"
+    "  if (c.a < 0.999) return c;\n"
+    "  float4 n = tex2D(s, uv + float2(0, -d.y)), so = tex2D(s, uv + float2(0, d.y));\n"
+    "  float4 e = tex2D(s, uv + float2(d.x, 0)), w = tex2D(s, uv + float2(-d.x, 0));\n"
+    "  if (min(min(n.a, so.a), min(e.a, w.a)) < 0.999) return c;\n"
+    "  float3 mn = min(c.rgb, min(min(n.rgb, so.rgb), min(e.rgb, w.rgb))), mx = max(c.rgb, max(max(n.rgb, so.rgb), max(e.rgb, w.rgb)));\n"
+    "  float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-5)));\n"
+    "  float3 wt = -amp / lerp(8.0, 5.0, k.x);\n"
+    "  return float4(saturate((c.rgb + (n.rgb + so.rgb + e.rgb + w.rgb) * wt) / (1.0 + 4.0 * wt)), 1);\n"
+    "}\n";
 static const char *PS_COPY =
     "sampler2D s : register(s0);\n"
     "float4 main(float2 t : TEXCOORD0) : COLOR { return float4(tex2D(s, t).rgb, 1); }\n";
@@ -321,6 +340,7 @@ static int d3d_init(void)
     ps_over = mk_ps(PS_OVER);
     ps_xbr = mk_ps(PS_XBR);
     ps_easu = mk_ps(PS_EASU);
+    ps_alpha_sharp = mk_ps(PS_ALPHA_SHARPEN);
     (void)ps_over;
     D3DVERTEXELEMENT9 el[] = {{0, 0, D3DDECLTYPE_FLOAT2, 0, D3DDECLUSAGE_POSITION, 0},
                               {0, 8, D3DDECLTYPE_FLOAT2, 0, D3DDECLUSAGE_TEXCOORD, 0}, D3DDECL_END()};
@@ -491,7 +511,13 @@ int present_rgb(const u32 *pix, int sw, int sh)
             IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, TRUE);
             IDirect3DDevice9_SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_ONE);   /* transparent texels are 0,0,0,0 */
             IDirect3DDevice9_SetRenderState(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-            blit(ov_tex, ov_w, ov_h, ps_alpha, vo, 1);
+            static int old_pano = -1;   /* test switch: the layer as before (no sharpening) */
+            if (old_pano < 0) old_pano = getenv(ENV("OLDPANO")) != NULL;
+            if (opt_sharpen && ps_alpha_sharp && !old_pano) {
+                float sk[4] = {opt_sharpen == 1 ? 0.3f : opt_sharpen == 2 ? 0.6f : 1.0f, 0, 0, 0};
+                IDirect3DDevice9_SetPixelShaderConstantF(dev, 2, sk, 1);
+                blit(ov_tex, vo.Width, vo.Height, ps_alpha_sharp, vo, 1);   /* ts = output pixels */
+            } else blit(ov_tex, ov_w, ov_h, ps_alpha, vo, 1);
             IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, FALSE);
         }
     }
@@ -531,6 +557,9 @@ void settings_load(void)
     opt_moviecolor = ini_int("video", "MovieColor", 1, 0, 1);
     opt_moviedeblock = ini_int("video", "MovieDeblock", 1, 0, 1);
     opt_moviedeband = ini_int("video", "MovieDeband", 1, 0, 1);
+    opt_panosharp = ini_int("video", "PanoramaSharp", 1, 0, 1);
+    if (getenv(ENV("PANOSHARP"))) opt_panosharp = atoi(getenv(ENV("PANOSHARP")));
+    if (getenv(ENV("OLDPANO"))) opt_panosharp = 0;
     if (getenv(ENV("FILTER"))) opt_filter = atoi(getenv(ENV("FILTER")));
     if (getenv(ENV("MOVIE"))) {   /* test switch: "cbd" letters = colour, deblock, deband on */
         const char *m = getenv(ENV("MOVIE"));
@@ -564,6 +593,7 @@ static void settings_save(void)
     put("MovieColor", opt_moviecolor);
     put("MovieDeblock", opt_moviedeblock);
     put("MovieDeband", opt_moviedeband);
+    put("PanoramaSharp", opt_panosharp);
     put("RenderScale", opt_render);
 }
 

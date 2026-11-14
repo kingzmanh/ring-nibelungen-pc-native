@@ -41,6 +41,8 @@ static int hr_n;
 static u16 *lo;                     /* what the warp wrote, 640x480 */
 static u8 *lo_on;                   /* 1 = written in this frame */
 static u32 *layer;
+static int njobs;                   /* N x blocks queued this frame (render_all) */
+static void render_all(int n);
 static u16 *shadow_tab;             /* the node's index table and codebook as last decoded */
 static u16 shadow_cb[TABLE_OFF / 2];
 
@@ -137,6 +139,7 @@ void N_pano_frame(void)
     fb_base = ARG(0);
     fb_pitch = ARG(1);
     frame_n = fb_pitch == 1280 ? n : 1;
+    if (pano_debug) { static int nl; if (nl++ < 3) rt_log("pano: frame buf %08x pitch %u n %d\n", fb_base, fb_pitch, frame_n); }
     if (frame_n > 1) {
         u32 src = RD32(cpu.r[R_ECX] + 4);   /* the node (this+4) - decoded again when it changed */
         if (tex && src != tex_src) tex_h = 0;
@@ -145,8 +148,9 @@ void N_pano_frame(void)
         if (!lo) { lo = malloc(640 * 480 * 2); lo_on = malloc(640 * 480); }
         memset(lo_on, 0, 640 * 480);
     }
+    njobs = 0;
     rt_wrap_orig("N_pano_frame", NULL)();
-    if (frame_n > 1) frame_ms = now_ms();
+    if (frame_n > 1) { render_all(frame_n); frame_ms = now_ms(); }
 }
 
 /* bilinear texel fetch, (u, v) in 16.16 with texel centres at +0.5 */
@@ -168,6 +172,101 @@ static inline u32 sample(s32 u, s32 v, int vlo, int vhi)
     u32 rb = (rb0 * (256 - fv) + rb1 * fv) >> 8 & 0xff00ff;
     u32 g = (g0 * (256 - fv) + g1 * fv) >> 8 & 0xff00;
     return 0xff000000u | rb | g;
+}
+
+/* Catmull-Rom (sharp bicubic) texel fetch: 4 x 4 texels, weights from a
+   table by the 8-bit fraction, overshoot clamped */
+static s16 crw[256][4];
+static void crw_init(void)
+{
+    for (int i = 0; i < 256; i++) {
+        double t = i / 256.0, t2 = t * t, t3 = t2 * t;
+        double w[4] = { -0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0, -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2 };
+        for (int k = 0; k < 4; k++) crw[i][k] = (s16)(w[k] * 1024.0 + (w[k] < 0 ? -0.5 : 0.5));
+    }
+}
+static inline u32 sample_cr(s32 u, s32 v, int vlo, int vhi)
+{
+    u -= 0x8000; v -= 0x8000;
+    int ui = (u >> 16), vi = (v >> 16);
+    const s16 *wx = crw[(u >> 8) & 0xff], *wy = crw[(v >> 8) & 0xff];
+    int us[4];
+    for (int k = 0; k < 4; k++) us[k] = (ui - 1 + k) & (PW - 1);
+    int r = 0, g = 0, b = 0;
+    for (int j = 0; j < 4; j++) {
+        int vv = vi - 1 + j;
+        vv = vv < vlo ? vlo : vv > vhi ? vhi : vv;
+        const u32 *row = tex + (size_t)vv * PW;
+        int hr_ = 0, hg = 0, hb = 0;
+        for (int k = 0; k < 4; k++) {
+            u32 c = row[us[k]];
+            hr_ += (int)((c >> 16) & 255) * wx[k]; hg += (int)((c >> 8) & 255) * wx[k]; hb += (int)(c & 255) * wx[k];
+        }
+        r += hr_ * wy[j]; g += hg * wy[j]; b += hb * wy[j];
+    }
+    r = (r + (1 << 19)) >> 20; g = (g + (1 << 19)) >> 20; b = (b + (1 << 19)) >> 20;
+    r = r < 0 ? 0 : r > 255 ? 255 : r; g = g < 0 ? 0 : g > 255 ? 255 : g; b = b < 0 ? 0 : b > 255 ? 255 : b;
+    return 0xff000000u | (u32)r << 16 | (u32)g << 8 | (u32)b;
+}
+
+/* the N x blocks of a frame are drawn after the game's frame, on worker threads */
+extern int opt_panosharp;
+typedef struct { int bx, by, vlo, vhi; s32 cu[4], cv[4]; } Job;
+static Job jobs[2048];
+static int njobs;
+static void render_job(const Job *j, int n)
+{
+    int W = 640 * n, S = 16 * n;
+    double inv = 1.0 / (16.0 * n);
+    int sharp = opt_panosharp;
+    for (int yy = 0; yy < S; yy++) {
+        double ty = ((yy + 0.5) - 0.5 * n) * inv;
+        double lu = j->cu[0] + (j->cu[2] - j->cu[0]) * ty, lv = j->cv[0] + (j->cv[2] - j->cv[0]) * ty;   /* left edge */
+        double ru = j->cu[1] + (j->cu[3] - j->cu[1]) * ty, rv = j->cv[1] + (j->cv[3] - j->cv[1]) * ty;   /* right edge */
+        double x0 = (0.5 - 0.5 * n) * inv;
+        s32 u = (s32)(lu + (ru - lu) * x0), v = (s32)(lv + (rv - lv) * x0);
+        s32 du = (s32)((ru - lu) * inv), dv = (s32)((rv - lv) * inv);
+        u32 *o = hr + (size_t)(j->by * n + yy) * W + j->bx * n;
+        if (sharp) for (int xx = 0; xx < S; xx++, u += du, v += dv) o[xx] = sample_cr(u, v, j->vlo, j->vhi);
+        else for (int xx = 0; xx < S; xx++, u += du, v += dv) o[xx] = sample(u, v, j->vlo, j->vhi);
+    }
+}
+
+#define NWORK 6
+static HANDLE work_go[NWORK], work_done[NWORK];
+static volatile LONG next_job;
+static int work_n;
+static DWORD WINAPI worker(LPVOID p)
+{
+    int id = (int)(intptr_t)p;
+    for (;;) {
+        WaitForSingleObject(work_go[id], INFINITE);
+        for (;;) {
+            LONG k = InterlockedIncrement(&next_job) - 1;
+            if (k >= njobs) break;
+            render_job(&jobs[k], work_n);
+        }
+        SetEvent(work_done[id]);
+    }
+    return 0;
+}
+static void render_all(int n)
+{
+    static int started;
+    if (!started) {
+        started = 1;
+        crw_init();
+        for (int i = 0; i < NWORK; i++) {
+            work_go[i] = CreateEventA(NULL, FALSE, FALSE, NULL);
+            work_done[i] = CreateEventA(NULL, FALSE, FALSE, NULL);
+            CreateThread(NULL, 0, worker, (LPVOID)(intptr_t)i, 0, NULL);
+        }
+    }
+    work_n = n;
+    next_job = 0;
+    for (int i = 0; i < NWORK; i++) SetEvent(work_go[i]);
+    WaitForMultipleObjects(NWORK, work_done, TRUE, INFINITE);
+    njobs = 0;
 }
 
 /* 4116d0(cdecl src, w, h, TL u,v, TR u,v, BL u,v, BR u,v, dst, skip): one block */
@@ -198,18 +297,12 @@ void N_pano_block(void)
         memcpy(lo + (by + y) * 640 + bx, MEM + dst + (u32)y * fb_pitch, 32);
         memset(lo_on + (by + y) * 640 + bx, 1, 16);
     }
-    /* N x: screen position s = (k + 0.5) / N - 0.5 within the block, (u, v) bilinear in the corners */
-    int W = 640 * n, S = 16 * n;
-    double inv = 1.0 / (16.0 * n);
-    for (int yy = 0; yy < S; yy++) {
-        double ty = ((yy + 0.5) - 0.5 * n) * inv;
-        double lu = cu[0] + (cu[2] - cu[0]) * ty, lv = cv[0] + (cv[2] - cv[0]) * ty;   /* left edge */
-        double ru = cu[1] + (cu[3] - cu[1]) * ty, rv = cv[1] + (cv[3] - cv[1]) * ty;   /* right edge */
-        double x0 = (0.5 - 0.5 * n) * inv;
-        s32 u = (s32)(lu + (ru - lu) * x0), v = (s32)(lv + (rv - lv) * x0);
-        s32 du = (s32)((ru - lu) * inv), dv = (s32)((rv - lv) * inv);
-        u32 *o = hr + (size_t)(by * n + yy) * W + bx * n;
-        for (int xx = 0; xx < S; xx++, u += du, v += dv) o[xx] = sample(u, v, vlo, vhi);
+    /* N x, drawn with the rest of the frame (render_job): screen position
+       s = (k + 0.5) / N - 0.5 within the block, (u, v) bilinear in the corners */
+    if (njobs < (int)(sizeof jobs / sizeof jobs[0])) {
+        Job *j = &jobs[njobs++];
+        j->bx = bx; j->by = by; j->vlo = vlo; j->vhi = vhi;
+        memcpy(j->cu, cu, sizeof cu); memcpy(j->cv, cv, sizeof cv);
     }
 }
 
