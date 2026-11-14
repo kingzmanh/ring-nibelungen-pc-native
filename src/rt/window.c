@@ -536,7 +536,15 @@ void api_ShowCursor(void) { guest_cursor_count += ARG(0) ? 1 : -1; win_cursor(gu
 void api_LoadCursorA(void) { u32 id = ARG(1); RET(ARG(0) ? 0x00050000u | (id & 0xffff) : 0x00060000u | (id & 0xffff), 2); }
 void api_LoadIconA(void) { RET(0x00070000u | (ARG(1) & 0xffff), 2); }
 void api_GetKeyState(void) { u32 s = keys[ARG(0) & 0xff]; RET(s ? 0xff80u : 0, 1); }
-void api_GetAsyncKeyState(void) { u32 s = keys[ARG(0) & 0xff]; RET(s ? 0x8000u : 0, 1); }
+/* the key state is live on Windows: games poll it in tight loops ("wait until
+   Esc is released") without reading messages, so the host's input is taken in here */
+void api_GetAsyncKeyState(void)
+{
+    static u32 last;
+    if (now_ms() - last >= 2) { last = now_ms(); win_pump(0); thr_yield(); }
+    u32 s = keys[ARG(0) & 0xff];
+    RET(s ? 0x8000u : 0, 1);
+}
 void api_GetKeyboardState(void) { memcpy(MEM + ARG(0), keys, 256); RET(1, 1); }
 void api_GetCursorPos(void) { int x, y; wm_get_cursor(&x, &y); WR32(ARG(0), x); WR32(ARG(0) + 4, y); RET(1, 1); }
 void api_SetCursorPos(void)
