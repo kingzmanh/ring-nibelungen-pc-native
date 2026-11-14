@@ -9,24 +9,7 @@ It doesn't use compatibility layers, wrappers or an emulator.
 
 ![A 360-degree view rendered at 4x](docs/media/panorama_4x.jpg)
 
-## Screenshots
-
-| | |
-|---|---|
-| ![Main menu](docs/media/menu.jpg) | ![Intro movie](docs/media/movie_planet.jpg) |
-| Main menu | Intro movie in full colour |
-| ![Intro movie](docs/media/movie_world.jpg) | ![Intro movie](docs/media/movie_ship.jpg) |
-| Intro movie | Intro movie |
-
-### Internal resolution: the 360-degree views are drawn again at up to 4x
-
-![1x vs 4x](docs/media/panorama_1x_vs_4x.jpg)
-
-The game's panoramas are stored as large compressed pictures that the original warps onto a 640x480
-screen. The port draws that warp again at up to 4x (2560x1920) straight from the stored picture, with
-sharp filtering, at 60 fps. Left to right: the original, plain 4x, 4x with sharp filtering (the default).
-
-### Movies in full colour
+## Movies in full colour
 
 ![Original vs ours](docs/media/movie_original_vs_ours.jpg)
 ![Original vs ours](docs/media/movie_original_vs_ours_2.jpg)
