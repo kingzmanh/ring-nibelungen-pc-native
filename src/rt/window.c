@@ -297,11 +297,13 @@ void present_frame(const u8 *pix, int pitch, const u32 *pal)
 }
 
 /* RGB565, w x h (640x480 times the internal resolution) */
+static int frame_ext;
 void present_frame16(const u8 *pix, int pitch, int w, int h)
 {
     frame_alloc();
     if (w * h > FMAX) return;
     fw = w; fh = h;
+    frame_ext = 0;
     for (int y = 0; y < h; y++) {
         const u16 *s = (const u16 *)(pix + y * pitch);
         u32 *d = frame + y * w;
@@ -315,14 +317,17 @@ void present_frame16(const u8 *pix, int pitch, int w, int h)
 }
 
 /* already 32-bit XRGB (movies decoded at full colour) */
-void present_frame32(const u32 *pix, int w, int h)
+  /* widescreen: columns added on each side of the game's 640 (mouse mapping) */
+void present_frame32_ext(const u32 *pix, int w, int h, int ext_px)
 {
     frame_alloc();
     if (w * h > FMAX) return;
     fw = w; fh = h;
+    frame_ext = ext_px;
     memcpy(frame, pix, (size_t)w * h * 4);
     frame_done();
 }
+void present_frame32(const u32 *pix, int w, int h) { present_frame32_ext(pix, w, h, 0); }
 
 /* ---------------- host window ---------------- */
 static int map_mouse(LPARAM lp, u32 *out)
@@ -332,7 +337,9 @@ static int map_mouse(LPARAM lp, u32 *out)
     int x, y, w, h;
     dest_rect(r.right, r.bottom, &x, &y, &w, &h);
     int mx = (short)LOWORD(lp), my = (short)HIWORD(lp);
-    int gx = w ? (mx - x) * 640 / w : 0, gy = h ? (my - y) * 480 / h : 0;
+    /* a widescreen frame: the game's 640 columns are the middle of fw */
+    int fwid = fw > 0 ? fw : 640;
+    int gx = w ? (mx - x) * fwid / w - frame_ext : 0, gy = h ? (my - y) * 480 / h : 0;
     if (gx < 0) gx = 0;
     if (gx > 639) gx = 639;
     if (gy < 0) gy = 0;

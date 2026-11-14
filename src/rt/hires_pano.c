@@ -43,6 +43,15 @@ static u8 *lo_on;                   /* 1 = written in this frame */
 static u32 *layer;
 static int njobs;                   /* N x blocks queued this frame (render_all) */
 static void render_all(int n);
+/* widescreen: the 360-degree view is drawn wider than the game's 640 columns
+   (two side strips of ext columns each, made by the game's own grid and block
+   code with the view plane's corners pushed outwards) */
+static int ext;                     /* columns per side in the frame being drawn (0 = 4:3) */
+static int lw = 640;                /* layer / wide frame width at 1x = 640 + 2 * ext */
+static int cur_xoff;                /* layer column of the buffer being drawn */
+static u32 strip_buf;               /* guest scratch for one strip at 1x */
+static u16 *strip_px;               /* both strips at 1x: (2 * ext) x rows, left then right */
+static int strip_rows, strip_ok;
 static u16 *shadow_tab;             /* the node's index table and codebook as last decoded */
 static u16 shadow_cb[TABLE_OFF / 2];
 
@@ -131,6 +140,63 @@ static void sync_node(u32 src)
     }
 }
 
+/* call a recompiled thiscall function (the original of a wrapped one) */
+static void call_this2(void (*f)(void), u32 ecx, u32 a0, u32 a1)
+{
+    u32 sp = cpu.r[R_ESP];
+    u32 ebx = cpu.r[R_EBX], esi = cpu.r[R_ESI], edi = cpu.r[R_EDI], ebp = cpu.r[R_EBP];
+    cpu.r[R_ESP] -= 4; WR32(cpu.r[R_ESP], a1);
+    cpu.r[R_ESP] -= 4; WR32(cpu.r[R_ESP], a0);
+    cpu.r[R_ESP] -= 4; WR32(cpu.r[R_ESP], MAGIC_RET);
+    cpu.r[R_ECX] = ecx;
+    f();
+    cpu.r[R_ESP] = sp;
+    cpu.r[R_EBX] = ebx; cpu.r[R_ESI] = esi; cpu.r[R_EDI] = edi; cpu.r[R_EBP] = ebp;
+}
+
+/* the two side strips: the view plane's corners (+8030: TL, TR, BL, BR, three
+   floats each) pushed out by ext columns, the grid rebuilt by the game's
+   411c80 + 412170 for ext/16 block columns, drawn by the game's 412220 into a
+   scratch buffer (and N x by our block hook); then everything restored */
+static void draw_strips(u32 g, void (*orig)(void))
+{
+    static u8 save[0x80b0];
+    int rows = (s32)RD32(g + 0x802c), cols = (s32)RD32(g + 0x8028);
+    if (cols != 40 || rows <= 0 || rows > 30) return;   /* only the normal 640-wide view */
+    memcpy(save, MEM + g, sizeof save);
+    float c[4][3];
+    memcpy(c, save + 0x8030, sizeof c);
+    if (!strip_buf) strip_buf = gmalloc(560 * 2 * 480 + 64);
+    int sw = ext;
+    strip_rows = rows * 16;
+    strip_px = realloc(strip_px, (size_t)2 * sw * strip_rows * 2);
+    u32 sb = fb_base, sp = fb_pitch;
+    for (int side = 0; side < 2; side++) {
+        double x0 = side ? 640.0 : -sw, x1 = x0 + sw;
+        for (int k = 0; k < 4; k++) {
+            double sx = ((k & 1) ? x1 : x0) / 640.0, ty = (k & 2) ? 1.0 : 0.0;
+            for (int a = 0; a < 3; a++) {
+                float v = (float)(c[0][a] + (c[1][a] - c[0][a]) * sx + (c[2][a] - c[0][a]) * ty);
+                u32 b;
+                memcpy(&b, &v, 4);
+                WR32(g + 0x8030 + 12 * k + 4 * a, b);
+            }
+        }
+        WR32(g + 0x8028, (u32)(sw / 16));
+        cpu.r[R_ECX] = g; guest_call(0x411c80u, 0);
+        cpu.r[R_ECX] = g; guest_call(0x412170u, 0);
+        fb_base = strip_buf; fb_pitch = (u32)(sw * 2);
+        cur_xoff = side ? ext + 640 : 0;
+        call_this2(orig, g, strip_buf, (u32)(sw * 2));
+        for (int y = 0; y < strip_rows; y++)
+            memcpy(strip_px + ((size_t)y * 2 * sw + side * sw), MEM + strip_buf + (u32)(y * sw * 2), (size_t)sw * 2);
+        memcpy(MEM + g, save, sizeof save);
+    }
+    fb_base = sb; fb_pitch = sp;
+    cur_xoff = ext;
+    strip_ok = 1;
+}
+
 /* 412220(this; frame buffer, pitch in bytes): one frame of the view */
 void N_pano_frame(void)
 {
@@ -139,18 +205,57 @@ void N_pano_frame(void)
     fb_base = ARG(0);
     fb_pitch = ARG(1);
     frame_n = fb_pitch == 1280 ? n : 1;
-    if (pano_debug) { static int nl; if (nl++ < 3) rt_log("pano: frame buf %08x pitch %u n %d\n", fb_base, fb_pitch, frame_n); }
+    if (pano_debug) {
+        static int nl;
+        if (nl++ < 3) {
+            u32 g = cpu.r[R_ECX];
+            rt_log("pano: frame buf %08x pitch %u n %d grid %08x cols %d rows %d off %08x %08x\n", fb_base, fb_pitch, frame_n, g,
+                   (s32)RD32(g + 0x8028), (s32)RD32(g + 0x802c), RD32(g + 0x809c), RD32(g + 0x80a0));
+            for (int k = 0; k < 4; k++) {
+                u32 a = g + 0x8030 + 12 * k, b0 = RD32(a), b1 = RD32(a + 4), b2 = RD32(a + 8);
+                float f0, f1, f2;
+                memcpy(&f0, &b0, 4); memcpy(&f1, &b1, 4); memcpy(&f2, &b2, 4);
+                rt_log("pano:   corner %d (%.4f, %.4f, %.4f)\n", k, f0, f1, f2);
+            }
+            rt_log("pano:   grid u row0 %08x %08x .. col40 %08x  v row0 %08x  row30 v %08x\n", RD32(g + 8), RD32(g + 12), RD32(g + 8 + 40 * 4),
+                   RD32(g + 0x4008), RD32(g + 0x4008 + 30 * 0x100));
+        }
+    }
+    u32 grid = cpu.r[R_ECX];
+    int main_frame = fb_pitch == 1280;
+    if (main_frame) {
+        int wide_ext_for(int h);
+        ext = wide_ext_for(480);
+        lw = 640 + 2 * ext;
+    }
+    cur_xoff = ext;
     if (frame_n > 1) {
         u32 src = RD32(cpu.r[R_ECX] + 4);   /* the node (this+4) - decoded again when it changed */
         if (tex && src != tex_src) tex_h = 0;
         else sync_node(src);
-        if (hr_n != frame_n) { free(hr); hr = malloc((size_t)640 * frame_n * 480 * frame_n * 4); hr_n = frame_n; }
+        static int hr_lw;
+        if (hr_n != frame_n || hr_lw != lw) { free(hr); hr = malloc((size_t)lw * frame_n * 480 * frame_n * 4); hr_n = frame_n; hr_lw = lw; }
         if (!lo) { lo = malloc(640 * 480 * 2); lo_on = malloc(640 * 480); }
         memset(lo_on, 0, 640 * 480);
     }
     njobs = 0;
-    rt_wrap_orig("N_pano_frame", NULL)();
-    if (frame_n > 1) { render_all(frame_n); frame_ms = now_ms(); }
+    void (*orig)(void) = rt_wrap_orig("N_pano_frame", NULL);
+    orig();
+    if (main_frame) strip_ok = 0;
+    if (main_frame && ext > 0) draw_strips(grid, orig);
+    if (main_frame) frame_ms = now_ms();
+    if (pano_debug && main_frame) { static int nl; if (nl++ < 2) rt_log("pano: %d N x blocks this frame (ext %d, strips %d)\n", njobs, ext, strip_ok); }
+    if (frame_n > 1) {
+        LARGE_INTEGER t0, t1, f;
+        QueryPerformanceCounter(&t0);
+        render_all(frame_n);
+        QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
+        if (pano_debug) {
+            static double acc; static int cnt;
+            acc += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart; cnt++;
+            if (cnt == 120) { rt_log("pano: N x drawing %.2f ms per frame\n", acc / cnt); acc = 0; cnt = 0; }
+        }
+    }
 }
 
 /* bilinear texel fetch, (u, v) in 16.16 with texel centres at +0.5 */
@@ -216,7 +321,7 @@ static Job jobs[2048];
 static int njobs;
 static void render_job(const Job *j, int n)
 {
-    int W = 640 * n, S = 16 * n;
+    int W = lw * n, S = 16 * n;
     double inv = 1.0 / (16.0 * n);
     int sharp = opt_panosharp;
     for (int yy = 0; yy < S; yy++) {
@@ -232,8 +337,9 @@ static void render_job(const Job *j, int n)
     }
 }
 
-#define NWORK 6
-static HANDLE work_go[NWORK], work_done[NWORK];
+#define NWORK_MAX 32
+static int nwork;                   /* half the logical processors, 2..32 */
+static HANDLE work_go[NWORK_MAX], work_done[NWORK_MAX];
 static volatile LONG next_job;
 static int work_n;
 static DWORD WINAPI worker(LPVOID p)
@@ -256,7 +362,13 @@ static void render_all(int n)
     if (!started) {
         started = 1;
         crw_init();
-        for (int i = 0; i < NWORK; i++) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        nwork = (int)si.dwNumberOfProcessors / 2;
+        if (nwork < 2) nwork = 2;
+        if (nwork > NWORK_MAX) nwork = NWORK_MAX;
+        rt_log("pano: %d drawing threads\n", nwork);
+        for (int i = 0; i < nwork; i++) {
             work_go[i] = CreateEventA(NULL, FALSE, FALSE, NULL);
             work_done[i] = CreateEventA(NULL, FALSE, FALSE, NULL);
             CreateThread(NULL, 0, worker, (LPVOID)(intptr_t)i, 0, NULL);
@@ -264,8 +376,8 @@ static void render_all(int n)
     }
     work_n = n;
     next_job = 0;
-    for (int i = 0; i < NWORK; i++) SetEvent(work_go[i]);
-    WaitForMultipleObjects(NWORK, work_done, TRUE, INFINITE);
+    for (int i = 0; i < nwork; i++) SetEvent(work_go[i]);
+    WaitForMultipleObjects((DWORD)nwork, work_done, TRUE, INFINITE);
     njobs = 0;
 }
 
@@ -280,7 +392,8 @@ void N_pano_block(void)
     if (n < 2 || w != 16 || h != 16 || dst < fb_base) return;
     u32 off = dst - fb_base;
     int bx = (int)((off % fb_pitch) / 2), by = (int)(off / fb_pitch);
-    if (bx + 16 > 640 || by + 16 > 480) return;
+    if (bx + 16 > (int)fb_pitch / 2 || by + 16 > 480) return;
+    int main_buf = cur_xoff == ext;
     /* the u wrap at 2048 texels: all four corners on the same side (as 411800 does) */
     for (int k = 1; k < 4; k++) {
         if (cu[k] - cu[0] > 0x4000000) cu[k] -= 0x8000000;
@@ -292,8 +405,8 @@ void N_pano_block(void)
     if (vhi >= PH_MAX) return;
     decode_node(src, vhi);
     if (vhi >= tex_h) vhi = tex_h - 1;
-    /* the game's 1x pixels of this block */
-    for (int y = 0; y < 16; y++) {
+    /* the game's 1x pixels of this block (the main view only) */
+    for (int y = 0; y < 16 && main_buf; y++) {
         memcpy(lo + (by + y) * 640 + bx, MEM + dst + (u32)y * fb_pitch, 32);
         memset(lo_on + (by + y) * 640 + bx, 1, 16);
     }
@@ -301,24 +414,25 @@ void N_pano_block(void)
        s = (k + 0.5) / N - 0.5 within the block, (u, v) bilinear in the corners */
     if (njobs < (int)(sizeof jobs / sizeof jobs[0])) {
         Job *j = &jobs[njobs++];
-        j->bx = bx; j->by = by; j->vlo = vlo; j->vhi = vhi;
+        j->bx = bx + cur_xoff; j->by = by; j->vlo = vlo; j->vhi = vhi;
         memcpy(j->cu, cu, sizeof cu); memcpy(j->cv, cv, sizeof cv);
     }
 }
 
-/* ddraw.c, presenting a 16-bit frame: the N x view where the screen still
-   shows the game's warped pixels */
-void pano_compose(u32 mem, int pitch)
+/* ddraw.c, presenting a 16-bit frame of the 360-degree view: the frame
+   widened by the side strips (when on), and the N x layer over everything
+   that still shows the game's warped pixels.  1 = presented here. */
+int pano_present(u32 mem, int pitch)
 {
     hires_layer.valid = 0;
-    int n = hr_n;
-    if (frame_n < 2 || n != frame_n || !lo || now_ms() - frame_ms > 250) return;
-    int W = 640 * n, H = 480 * n;
-    if (!layer) layer = malloc((size_t)2560 * 1920 * 4);
+    if (now_ms() - frame_ms > 250) return 0;
+    int n = frame_n > 1 && hr_n == frame_n && lo ? frame_n : 1;
+    int wide = ext > 0 && strip_ok;
+    if (!wide && n < 2) return 0;
     /* where the frame buffer sits on the screen: the row offset that matches
        best on pixels with detail (black sky matches anywhere) */
-    static int dy_best;
-    {
+    static int dy_best = 16;
+    if (lo) {
         static u32 t;
         if (now_ms() - t > 500) {
             t = now_ms();
@@ -338,30 +452,82 @@ void pano_compose(u32 mem, int pitch)
         }
     }
     int oy = dy_best;
-    int any = 0, hit = 0, tot = 0;
+    int E = wide ? ext : 0, FW = 640 + 2 * E;
+    /* the 1x frame: the screen in the middle, the strips at the sides */
+    static u32 *base;
+    base = realloc(base, (size_t)FW * 480 * 4);
     for (int y = 0; y < 480; y++) {
-        int sy = y + oy;
-        int inside = sy >= 0 && sy < 480;
-        const u16 *scr = (const u16 *)(MEM + mem + (u32)(inside ? sy : 0) * pitch);
-        const u16 *l = lo + y * 640;
-        static const u8 none[640];
-        const u8 *on = inside ? lo_on + y * 640 : none;
-        for (int x = 0; x < 640; x++) {
-            int ok = on[x] && scr[x] == l[x];
-            tot += on[x]; hit += ok; any |= ok;
-            for (int yy = 0; yy < n; yy++) {
-                u32 *o = layer + (size_t)(y * n + yy) * W + x * n;
-                const u32 *h = hr + (size_t)(y * n + yy) * W + x * n;
-                if (ok) for (int xx = 0; xx < n; xx++) o[xx] = h[xx];
-                else for (int xx = 0; xx < n; xx++) o[xx] = 0;
+        const u16 *scr = (const u16 *)(MEM + mem + (u32)y * pitch);
+        u32 *d = base + (size_t)y * FW;
+        int fy = y - oy;
+        int srow = wide && fy >= 0 && fy < strip_rows;
+        for (int x = 0; x < E; x++) {
+            d[x] = srow ? c565(strip_px[(size_t)fy * 2 * E + x]) : 0;
+            d[E + 640 + x] = srow ? c565(strip_px[(size_t)fy * 2 * E + E + x]) : 0;
+        }
+        for (int x = 0; x < 640; x++) d[E + x] = c565(scr[x]);
+    }
+    if (n > 1) {
+        int LW = FW * n, H = 480 * n;
+        int hit = 0, tot = 0;
+        int hrW = lw * n;   /* hr is laid out at the drawing width */
+        u32 *L;
+        if (FW == lw) {
+            /* the N x picture is the layer itself: pixels not to show get alpha 0
+               in place (hr is drawn anew every frame) - no copy of the whole picture */
+            L = hr;
+            int rows_drawn = ext > 0 ? strip_rows : 448;
+            for (int y = 0; y < 480; y++) {
+                if (y >= rows_drawn) { memset(hr + (size_t)y * n * hrW, 0, (size_t)n * hrW * 4); continue; }
+                int sy = y + oy;
+                int inside = sy >= 0 && sy < 480;
+                const u16 *scr = (const u16 *)(MEM + mem + (u32)(inside ? sy : 0) * pitch);
+                for (int x = 0; x < 640; x++) {
+                    int on = inside && lo_on[y * 640 + x];
+                    int ok = on && scr[x] == lo[y * 640 + x];
+                    tot += on; hit += ok;
+                    if (ok) continue;
+                    for (int yy = 0; yy < n; yy++) memset(hr + (size_t)(y * n + yy) * hrW + (size_t)(E + x) * n, 0, (size_t)n * 4);
+                }
+            }
+        } else {
+            /* the strips are not there this frame: copy the middle */
+            layer = realloc(layer, (size_t)LW * H * 4);
+            L = layer;
+            for (int y = 0; y < 480; y++) {
+                int sy = y + oy;
+                int inside = sy >= 0 && sy < 480;
+                const u16 *scr = (const u16 *)(MEM + mem + (u32)(inside ? sy : 0) * pitch);
+                for (int x = 0; x < 640; x++) {
+                    int on = inside && lo_on[y * 640 + x];
+                    int ok = on && scr[x] == lo[y * 640 + x];
+                    tot += on; hit += ok;
+                    int hx = x + (lw - 640) / 2;
+                    for (int yy = 0; yy < n; yy++) {
+                        u32 *o = layer + (size_t)(y * n + yy) * LW + x * n;
+                        const u32 *hh = hr + (size_t)(y * n + yy) * hrW + hx * n;
+                        if (ok) memcpy(o, hh, (size_t)n * 4);
+                        else memset(o, 0, (size_t)n * 4);
+                    }
+                }
             }
         }
+        if (pano_debug) {
+            static u32 t;
+            if (now_ms() - t > 1000) { t = now_ms(); rt_log("pano: %dx, %d of %d warped pixels on screen (row offset %d), frame width %d\n", n, hit, tot, oy, FW); }
+        }
+        /* layer row y = frame buffer row y = screen row y + oy */
+        hires_layer = (HiresLayer){ L, LW, H, 0, oy, FW, 480, 1 };
     }
+    void present_frame32_ext(const u32 *pix, int w, int h, int ext_px);
+    LARGE_INTEGER t0, t1, f;
+    QueryPerformanceCounter(&t0);
+    present_frame32_ext(base, FW, 480, E);
+    QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
     if (pano_debug) {
-        static u32 t;
-        if (now_ms() - t > 1000) { t = now_ms(); rt_log("pano: %dx, %d of %d warped pixels on screen (row offset %d)\n", n, hit, tot, oy); }
+        static double acc; static int cnt;
+        acc += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart; cnt++;
+        if (cnt == 120) { rt_log("pano: presenting %.2f ms per frame\n", acc / cnt); acc = 0; cnt = 0; }
     }
-    if (!any) return;
-    /* layer row y = frame buffer row y = screen row y + oy (rows outside: alpha 0) */
-    hires_layer = (HiresLayer){ layer, W, H, 0, oy, 640, 480, 1 };
+    return 1;
 }

@@ -234,6 +234,30 @@ int movie_present(u32 mem, int pitch)
         }
     }
     if (tot && hit * 4 < tot) return 0;   /* the frame is not (or no longer) on the screen */
+    /* widescreen fill (option): the rows of the screen's shape around the
+       picture's centre, moved down if a subtitle would be cut off */
+    extern int opt_moviefillwide;
+    int wide_ext_for(int h);
+    int E = opt_moviefillwide ? wide_ext_for(480) : 0;
+    if (E > 0) {
+        int H = 640 * 480 / (640 + 2 * E);
+        int top = oy_best + mh / 2 - H / 2;
+        int need = 0;   /* last row with game drawing (subtitles) below the picture's lower part */
+        for (int y = 479; y >= top + H && !need; y--) {
+            const u16 *s = (const u16 *)(MEM + mem + (u32)y * pitch);
+            int fy = y - oy_best, lit = 0;
+            for (int x = 0; x < 640; x += 2) {
+                int moviepx = fy >= 0 && fy < mh && s[x] == to565(mframe[(size_t)fy * mw + x]);
+                if (!moviepx && (s[x] & 0xe79c)) lit++;
+            }
+            if (lit >= 6) need = y + 1;
+        }
+        if (need > top + H) top = need - H;
+        if (top < 0) top = 0;
+        if (top + H > 480) top = 480 - H;
+        present_frame32(out + (size_t)top * 640, 640, H);
+        return 1;
+    }
     present_frame32(out, 640, 480);
     return 1;
 }

@@ -23,7 +23,10 @@ int opt_scale = 0;
 int opt_moviecolor = 1;
 int opt_moviefull = 1;    /* (unused in Ring: its movies are 640x448 in the 640x480 screen) */
 int opt_moviedeblock = 1, opt_moviedeband = 1;
-int opt_panosharp = 1;    /* panoramas: sharp bicubic sampling (0 = smooth bilinear) */   /* movie_hq.c clean-up of the decoded frames */
+int opt_panosharp = 1;
+/* widescreen 360-degree views: 0 = off (4:3), 1 = match the monitor, 2 = 16:10, 3 = 16:9, 4 = 21:9 */
+int opt_wide = 1;
+int opt_moviefillwide = 0;   /* movies zoomed to the wide shape (crops top / bottom) */    /* panoramas: sharp bicubic sampling (0 = smooth bilinear) */   /* movie_hq.c clean-up of the decoded frames */
 int opt_render = 4;       /* internal resolution of the live 3D (1 = original) */   /* movies from the decoder in 24-bit colour instead of the game's 16-bit copy */
 static char ini_path[700];
 static HWND hwnd;
@@ -558,6 +561,10 @@ void settings_load(void)
     opt_moviedeblock = ini_int("video", "MovieDeblock", 1, 0, 1);
     opt_moviedeband = ini_int("video", "MovieDeband", 1, 0, 1);
     opt_panosharp = ini_int("video", "PanoramaSharp", 1, 0, 1);
+    opt_wide = ini_int("video", "Widescreen", 1, 0, 4);
+    opt_moviefillwide = ini_int("video", "MovieFillWidescreen", 0, 0, 1);
+    if (getenv(ENV("MOVIEFILL"))) opt_moviefillwide = atoi(getenv(ENV("MOVIEFILL")));
+    if (getenv(ENV("WIDE"))) opt_wide = atoi(getenv(ENV("WIDE")));
     if (getenv(ENV("PANOSHARP"))) opt_panosharp = atoi(getenv(ENV("PANOSHARP")));
     if (getenv(ENV("OLDPANO"))) opt_panosharp = 0;
     if (getenv(ENV("FILTER"))) opt_filter = atoi(getenv(ENV("FILTER")));
@@ -594,12 +601,14 @@ static void settings_save(void)
     put("MovieDeblock", opt_moviedeblock);
     put("MovieDeband", opt_moviedeband);
     put("PanoramaSharp", opt_panosharp);
+    put("Widescreen", opt_wide);
+    put("MovieFillWidescreen", opt_moviefillwide);
     put("RenderScale", opt_render);
 }
 
 /* ---------------- menu bar ---------------- */
 enum { ID_FILTER = 1000, ID_SHARP = 1010, ID_FXAA = 1020, ID_ASPECT = 1030, ID_WIN = 1040, ID_FULLSCREEN = 1050,
-       ID_SHOWFPS = 1051, ID_CONTROLS = 1060, ID_ABOUT = 1061, ID_SCALE = 1070, ID_MOVIECOLOR = 1080, ID_RENDER = 1090, ID_MOVIEFULL = 1081, ID_MOVIEDEBLOCK = 1082, ID_MOVIEDEBAND = 1083 };
+       ID_SHOWFPS = 1051, ID_CONTROLS = 1060, ID_ABOUT = 1061, ID_SCALE = 1070, ID_MOVIECOLOR = 1080, ID_RENDER = 1090, ID_MOVIEFULL = 1081, ID_MOVIEDEBLOCK = 1082, ID_MOVIEDEBAND = 1083, ID_WIDE = 1100, ID_MOVIEFILLWIDE = 1084 };
 static HMENU g_menu;
 static WINDOWPLACEMENT wpl = { sizeof wpl };
 
@@ -614,6 +623,8 @@ static void update_checks(void)
     CheckMenuItem(g_menu, ID_MOVIEDEBLOCK, MF_BYCOMMAND | (opt_moviedeblock ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(g_menu, ID_MOVIEDEBAND, MF_BYCOMMAND | (opt_moviedeband ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuRadioItem(g_menu, ID_RENDER + 1, ID_RENDER + 4, ID_RENDER + opt_render, MF_BYCOMMAND);
+    CheckMenuRadioItem(g_menu, ID_WIDE, ID_WIDE + 4, ID_WIDE + opt_wide, MF_BYCOMMAND);
+    CheckMenuItem(g_menu, ID_MOVIEFILLWIDE, MF_BYCOMMAND | (opt_moviefillwide ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(g_menu, ID_FULLSCREEN, MF_BYCOMMAND | (opt_fullscreen ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(g_menu, ID_SHOWFPS, MF_BYCOMMAND | (opt_showfps ? MF_CHECKED : MF_UNCHECKED));
 }
@@ -657,6 +668,19 @@ static HMENU build_menu(void)
     AppendMenuW(rend, MF_STRING | MF_GRAYED, 0, L"The 360-degree views are drawn at this many times");
     AppendMenuW(rend, MF_STRING | MF_GRAYED, 0, L"the original resolution, with smooth filtering");
     AppendMenuW(video, MF_POPUP, (UINT_PTR)rend, L"&Internal Resolution (panoramas)");
+    HMENU widem = CreatePopupMenu();
+    AppendMenuW(widem, MF_STRING, ID_WIDE + 1, L"Match the monitor  (default)");
+    AppendMenuW(widem, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(widem, MF_STRING, ID_WIDE + 0, L"Off  (original 4:3)");
+    AppendMenuW(widem, MF_STRING, ID_WIDE + 2, L"16:10");
+    AppendMenuW(widem, MF_STRING, ID_WIDE + 3, L"16:9");
+    AppendMenuW(widem, MF_STRING, ID_WIDE + 4, L"21:9");
+    AppendMenuW(widem, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(widem, MF_STRING, ID_MOVIEFILLWIDE, L"Movies fill the wide screen  (zoomed, crops top and bottom)");
+    AppendMenuW(widem, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(widem, MF_STRING | MF_GRAYED, 0, L"The 360-degree views show more at the sides (real picture, not stretched);");
+    AppendMenuW(widem, MF_STRING | MF_GRAYED, 0, L"movies, puzzles and menus stay 4:3 with bars");
+    AppendMenuW(video, MF_POPUP, (UINT_PTR)widem, L"&Widescreen");
     AppendMenuW(video, MF_POPUP, (UINT_PTR)res, L"&Resolution");
     AppendMenuW(video, MF_POPUP, (UINT_PTR)asp, L"&Aspect Ratio");
     AppendMenuW(video, MF_POPUP, (UINT_PTR)filt, L"Upscale &Filter");
@@ -729,6 +753,8 @@ int present_menu_command(int id)
     else if (id >= ID_ASPECT && id <= ID_ASPECT + 2) opt_aspect = id - ID_ASPECT;
     else if (id == ID_FXAA) opt_fxaa = !opt_fxaa;
     else if (id == ID_MOVIECOLOR) opt_moviecolor = !opt_moviecolor;
+    else if (id >= ID_WIDE && id <= ID_WIDE + 4) opt_wide = id - ID_WIDE;
+    else if (id == ID_MOVIEFILLWIDE) opt_moviefillwide = !opt_moviefillwide;
     else if (id == ID_MOVIEDEBLOCK) opt_moviedeblock = !opt_moviedeblock;
     else if (id == ID_MOVIEDEBAND) opt_moviedeband = !opt_moviedeband;
     else if (id > ID_RENDER && id <= ID_RENDER + 4) opt_render = id - ID_RENDER;
@@ -880,4 +906,28 @@ void present_record(void)
         state = 2;
         rt_log("record: done\n");
     }
+}
+
+/* hires_pano.c: columns to add on each side of the 640-wide view so a frame
+   h rows high gets the chosen shape (whole 16-pixel blocks) */
+int wide_ext_for(int h)
+{
+    double a;
+    switch (opt_wide) {
+    case 0: return 0;
+    case 2: a = 16.0 / 10.0; break;
+    case 3: a = 16.0 / 9.0; break;
+    case 4: a = 21.0 / 9.0; break;
+    default: {
+        HMONITOR m = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO mi = { sizeof mi };
+        if (!hwnd || !GetMonitorInfoA(m, &mi)) return 0;
+        a = (double)(mi.rcMonitor.right - mi.rcMonitor.left) / (double)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+    }
+    }
+    double extra = (a * h - 640.0) / 2.0;
+    if (extra < 8.0) return 0;
+    int blocks = (int)((extra + 15.0) / 16.0);
+    if (blocks > 30) blocks = 30;   /* 21:9 and narrower; the grid holds 63 block columns */
+    return blocks * 16;
 }
