@@ -41,6 +41,8 @@ static int hr_n;
 static u16 *lo;                     /* what the warp wrote, 640x480 */
 static u8 *lo_on;                   /* 1 = written in this frame */
 static u32 *layer;
+static u16 *shadow_tab;             /* the node's index table and codebook as last decoded */
+static u16 shadow_cb[TABLE_OFF / 2];
 
 static inline u32 c565(u32 c)
 {
@@ -77,6 +79,54 @@ static void decode_node(u32 src, int vmax)
     }
     tex_src = src; tex_hash = node_hash(src); tex_h = H;
     if (pano_debug) rt_log("pano: node %08x decoded (%d rows)\n", src, H);
+    /* shadow copies to follow later changes (animations written into the node) */
+    shadow_tab = realloc(shadow_tab, (size_t)H * (PW / 4) * 2);
+    memcpy(shadow_tab, tab, (size_t)H * (PW / 4) * 2);
+    memcpy(shadow_cb, cb, TABLE_OFF);
+}
+
+/* once per frame: texels whose index or codebook entry changed since the last
+   look are decoded again (the game animates things inside the node itself) */
+static void sync_node(u32 src)
+{
+    if (!tex || src != tex_src || !tex_h || !shadow_tab) return;
+    const u16 *cb = (const u16 *)(MEM + src);
+    const u16 *tab = (const u16 *)(MEM + src + TABLE_OFF);
+    int ngroups = tex_h * (PW / 4);
+    /* codebook entries (4 texels each) that changed */
+    static u8 cbdirty[TABLE_OFF / 8];
+    int ncb = 0;
+    for (u32 e = 0; e < TABLE_OFF / 8; e++) {
+        int d = memcmp(cb + e * 4, shadow_cb + e * 4, 8) != 0;
+        cbdirty[e] = (u8)d;
+        if (d) { memcpy(shadow_cb + e * 4, cb + e * 4, 8); ncb++; }
+    }
+    int nt = 0, x0 = PW, x1 = -1, y0 = tex_h, y1 = -1;
+    for (int g = 0; g < ngroups; g++) {
+        u16 idx = tab[g];
+        int changed = idx != shadow_tab[g];
+        if (!changed && !(ncb && idx < TABLE_OFF / 8 && cbdirty[idx])) continue;
+        shadow_tab[g] = idx;
+        const u16 *p = cb + (u32)idx * 4;
+        int v = g / (PW / 4), u = (g % (PW / 4)) * 4;
+        u32 *o = tex + (size_t)v * PW + u;
+        o[0] = c565(p[0]); o[1] = c565(p[1]); o[2] = c565(p[2]); o[3] = c565(p[3]);
+        nt++;
+        if (u < x0) x0 = u;
+        if (u + 3 > x1) x1 = u + 3;
+        if (v < y0) y0 = v;
+        if (v > y1) y1 = v;
+    }
+    if (pano_debug && (nt || ncb)) {
+        static u32 t;
+        static int frames, total;
+        frames++; total += nt;
+        if (now_ms() - t > 1000) {
+            rt_log("pano: node changes: %d texel groups in %d frames (last frame: %d groups, %d codebook entries, area %d,%d-%d,%d)\n",
+                   total, frames, nt, ncb, x0, y0, x1, y1);
+            t = now_ms(); frames = total = 0;
+        }
+    }
 }
 
 /* 412220(this; frame buffer, pitch in bytes): one frame of the view */
@@ -89,7 +139,8 @@ void N_pano_frame(void)
     frame_n = fb_pitch == 1280 ? n : 1;
     if (frame_n > 1) {
         u32 src = RD32(cpu.r[R_ECX] + 4);   /* the node (this+4) - decoded again when it changed */
-        if (tex && (src != tex_src || node_hash(src) != tex_hash)) tex_h = 0;
+        if (tex && src != tex_src) tex_h = 0;
+        else sync_node(src);
         if (hr_n != frame_n) { free(hr); hr = malloc((size_t)640 * frame_n * 480 * frame_n * 4); hr_n = frame_n; }
         if (!lo) { lo = malloc(640 * 480 * 2); lo_on = malloc(640 * 480); }
         memset(lo_on, 0, 640 * 480);
