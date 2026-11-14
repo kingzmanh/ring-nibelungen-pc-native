@@ -43,6 +43,30 @@ void N_movie_decode(void)
     }
     mserial++;
     mframe_ms = now_ms();
+    {   /* MOVIEDUMP=folder: every decoded frame as a 24-bit BMP, named <serial>_<ms since start> (AI test packs) */
+        static const char *dd;
+        static int dd_init;
+        if (!dd_init) { dd_init = 1; dd = getenv(ENV("MOVIEDUMP")); }
+        if (dd) {
+            extern u32 win_time(void);
+            char path[700];
+            snprintf(path, sizeof path, "%s\\%s\\f%06u_%08u.bmp", rt_exe_dir, dd, mserial, win_time());
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                int stride = w * 3;
+                BITMAPFILEHEADER fh = { 0x4d42, (DWORD)(sizeof fh + 40 + (size_t)stride * h), 0, 0, sizeof fh + 40 };
+                BITMAPINFOHEADER ih = { 40, w, -h, 1, 24, 0, (DWORD)((size_t)stride * h), 0, 0, 0, 0 };
+                fwrite(&fh, sizeof fh, 1, f); fwrite(&ih, 40, 1, f);
+                u8 *row = malloc((size_t)stride);
+                for (int y = 0; y < h; y++) {
+                    for (int x = 0; x < w; x++) { u32 c = mframe[(size_t)y * w + x]; row[3 * x] = (u8)c; row[3 * x + 1] = (u8)(c >> 8); row[3 * x + 2] = (u8)(c >> 16); }
+                    fwrite(row, 1, (size_t)stride, f);
+                }
+                free(row);
+                fclose(f);
+            }
+        }
+    }
     if (mdebug) {
         static u32 t, n0;
         if (now_ms() - t > 1000) {
