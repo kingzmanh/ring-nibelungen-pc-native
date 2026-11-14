@@ -1,0 +1,1 @@
+# hand-written natives: <addr> <C name> [wrap = the original stays callable]
