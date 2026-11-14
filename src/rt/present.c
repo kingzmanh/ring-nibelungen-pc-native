@@ -4,7 +4,7 @@
  * window with the chosen filter (nearest, bilinear, Catmull-Rom bicubic,
  * sharp bilinear, xBR), optional contrast-adaptive sharpening - the same
  * post chain as our other ports (Dos tools kit).  Options are in the
- * window's menu bar (Video / View / Help) and neverhood.ini [video]. */
+ * window's menu bar (Video / View / Help) and ring.ini [video]. */
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
 #include <windows.h>
@@ -15,13 +15,14 @@
 #include <wchar.h>
 #include "rt.h"
 
-int opt_fullscreen = 1, opt_filter = 2, opt_sharpen = 1, opt_fxaa = 0, opt_aspect = 0, opt_showfps = 0;
+int opt_fullscreen = 1, opt_filter = 5, opt_sharpen = 1, opt_fxaa = 0, opt_aspect = 0, opt_showfps = 0;
 /* Resolution: 0 = upscale straight to the window; 1-4 = upscale to N x
    640x480 first (the filter works at a whole multiple), then fit that
    picture to the window.  The game's art is 640x480: no extra detail. */
 int opt_scale = 0;
 int opt_moviecolor = 1;
-int opt_moviefull = 1;    /* movies fill the screen (only the picture, no letterbox) */
+int opt_moviefull = 1;    /* (unused in Ring: its movies are 640x448 in the 640x480 screen) */
+int opt_moviedeblock = 1, opt_moviedeband = 1;   /* movie_hq.c clean-up of the decoded frames */
 int opt_render = 4;       /* internal resolution of the live 3D (1 = original) */   /* movies from the decoder in 24-bit colour instead of the game's 16-bit copy */
 static char ini_path[700];
 static HWND hwnd;
@@ -35,7 +36,7 @@ static int ov_w, ov_h;
 static IDirect3DSurface9 *aa_surf, *up_surf;
 static UINT up_w, up_h;
 static IDirect3DVertexShader9 *vs_blit;
-static IDirect3DPixelShader9 *ps_alpha, *ps_copy, *ps_bicubic, *ps_sharpbil, *ps_fxaa, *ps_sharpen, *ps_over, *ps_xbr;
+static IDirect3DPixelShader9 *ps_alpha, *ps_copy, *ps_bicubic, *ps_sharpbil, *ps_fxaa, *ps_sharpen, *ps_over, *ps_xbr, *ps_easu;
 static IDirect3DVertexDeclaration9 *blit_decl;
 static int d3d_ok;
 
@@ -72,6 +73,51 @@ static const char *VS_BLIT =
    rules: corner/edge detection on luma in a 5x5 neighbourhood, 30/45/60
    degree edges redrawn as smooth lines, blended over about one output
    pixel) - for 2D screens, fonts and the game's sprites */
+/* edge-adaptive upscaler (own implementation of the idea behind FSR 1's
+   EASU): 12 source texels around the output point, the local edge
+   direction and strength from their luma gradients, a Lanczos-2-like
+   kernel stretched along the edge and narrowed across it, then clamped to
+   the nearest 2x2 texels so it cannot ring.  Sharp edges, no stair steps,
+   smooth gradients stay smooth. */
+static const char *PS_EASU =
+    "sampler2D s : register(s0);\n"
+    "float4 ts : register(c1);\n"
+    "float3 T(float2 p) { return tex2Dlod(s, float4((p + 0.5) * ts.zw, 0, 0)).rgb; }\n"
+    "float L(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
+    "void tap(inout float3 acc, inout float ws, float2 v, float2 dir, float2 len2, float lob, float clp, float3 c) {\n"
+    "  float2 r = float2(v.x * dir.x + v.y * dir.y, v.x * -dir.y + v.y * dir.x) * len2;\n"
+    "  float d2 = min(dot(r, r), clp);\n"
+    "  float wB = 0.4 * d2 - 1.0, wA = lob * d2 - 1.0;\n"
+    "  wB *= wB; wA *= wA; wB = 1.5625 * wB - 0.5625;\n"
+    "  float w = wB * wA; acc += c * w; ws += w;\n"
+    "}\n"
+    "float4 main(float2 uv : TEXCOORD0) : COLOR {\n"
+    "  float2 pp = uv * ts.xy - 0.5, fp = floor(pp), f = pp - fp;\n"
+    "  float3 b = T(fp + float2(0, -1)), c = T(fp + float2(1, -1));\n"
+    "  float3 e = T(fp + float2(-1, 0)), F = T(fp), G = T(fp + float2(1, 0)), h = T(fp + float2(2, 0));\n"
+    "  float3 i = T(fp + float2(-1, 1)), j = T(fp + float2(0, 1)), k = T(fp + float2(1, 1)), l = T(fp + float2(2, 1));\n"
+    "  float3 n = T(fp + float2(0, 2)), o = T(fp + float2(1, 2));\n"
+    "  float lb = L(b), lc = L(c), le = L(e), lf = L(F), lg = L(G), lh = L(h), li = L(i), lj = L(j), lk = L(k), ll = L(l), ln = L(n), lo = L(o);\n"
+    "  // gradients at the four inner texels, weighted by the position between them\n"
+    "  float2 gF = float2(lg - le, lj - lb), gG = float2(lh - lf, lk - lc), gJ = float2(lk - li, ln - lf), gK = float2(ll - lj, lo - lg);\n"
+    "  float2 g = gF * (1 - f.x) * (1 - f.y) + gG * f.x * (1 - f.y) + gJ * (1 - f.x) * f.y + gK * f.x * f.y;\n"
+    "  float gl = length(g);\n"
+    "  float2 dir = gl > 1e-4 ? g / gl : float2(1, 0);\n"
+    "  float len = saturate(gl * 4.0); len *= len;\n"
+    "  float stretch = (dir.x * dir.x + dir.y * dir.y) / max(abs(dir.x), abs(dir.y));\n"
+    "  float2 len2 = float2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);\n"
+    "  float lob = 0.5 + (0.25 - 0.04 - 0.5) * len, clp = 1.0 / lob;\n"
+    "  float3 acc = 0; float ws = 0;\n"
+    "  tap(acc, ws, float2(0, -1) - f, dir, len2, lob, clp, b); tap(acc, ws, float2(1, -1) - f, dir, len2, lob, clp, c);\n"
+    "  tap(acc, ws, float2(-1, 0) - f, dir, len2, lob, clp, e); tap(acc, ws, float2(0, 0) - f, dir, len2, lob, clp, F);\n"
+    "  tap(acc, ws, float2(1, 0) - f, dir, len2, lob, clp, G); tap(acc, ws, float2(2, 0) - f, dir, len2, lob, clp, h);\n"
+    "  tap(acc, ws, float2(-1, 1) - f, dir, len2, lob, clp, i); tap(acc, ws, float2(0, 1) - f, dir, len2, lob, clp, j);\n"
+    "  tap(acc, ws, float2(1, 1) - f, dir, len2, lob, clp, k); tap(acc, ws, float2(2, 1) - f, dir, len2, lob, clp, l);\n"
+    "  tap(acc, ws, float2(0, 2) - f, dir, len2, lob, clp, n); tap(acc, ws, float2(1, 2) - f, dir, len2, lob, clp, o);\n"
+    "  float3 mn = min(min(F, G), min(j, k)), mx = max(max(F, G), max(j, k));\n"
+    "  return float4(clamp(acc / max(ws, 1e-5), mn, mx), 1);\n"
+    "}\n";
+
 static const char *PS_XBR =
     "sampler2D s : register(s0);\n"
     "float4 ts : register(c1);   // w, h, 1/w, 1/h of the source\n"
@@ -274,6 +320,7 @@ static int d3d_init(void)
     ps_sharpen = mk_ps(PS_SHARPEN);
     ps_over = mk_ps(PS_OVER);
     ps_xbr = mk_ps(PS_XBR);
+    ps_easu = mk_ps(PS_EASU);
     (void)ps_over;
     D3DVERTEXELEMENT9 el[] = {{0, 0, D3DDECLTYPE_FLOAT2, 0, D3DDECLUSAGE_POSITION, 0},
                               {0, 8, D3DDECLTYPE_FLOAT2, 0, D3DDECLUSAGE_TEXCOORD, 0}, D3DDECL_END()};
@@ -407,7 +454,8 @@ int present_rgb(const u32 *pix, int sw, int sh)
         float k[4] = {(float)uw / sw, (float)uh / sh, 0, 0};
         int fit = uw != dw || uh != dh;   /* the upscaled picture is fitted to the window (linear) */
         IDirect3DDevice9_SetPixelShaderConstantF(dev, 2, k, 1);
-        if (opt_filter == 4 && ps_xbr) blit(cur, sw, sh, ps_xbr, vu, 0);
+        if (opt_filter == 5 && ps_easu) blit(cur, sw, sh, ps_easu, vu, 0);
+        else if (opt_filter == 4 && ps_xbr) blit(cur, sw, sh, ps_xbr, vu, 0);
         else if (opt_filter == 2 && ps_bicubic) blit(cur, sw, sh, ps_bicubic, vu, 1);
         else if (opt_filter == 3 && ps_sharpbil) blit(cur, sw, sh, ps_sharpbil, vu, 1);
         else blit(cur, sw, sh, ps_copy, vu, opt_filter != 0);
@@ -472,14 +520,20 @@ void settings_load(void)
 {
     snprintf(ini_path, sizeof ini_path, "%s\\" GAME_SHORT ".ini", rt_exe_dir);
     opt_fullscreen = ini_int("video", "Fullscreen", 1, 0, 1);
-    opt_filter = ini_int("video", "Filter", 2, 0, 4);
+    opt_filter = ini_int("video", "Filter", 5, 0, 5);
     opt_sharpen = ini_int("video", "Sharpen", 1, 0, 3);
     opt_fxaa = ini_int("video", "FXAA", 0, 0, 1);
     opt_aspect = ini_int("video", "Aspect", 0, 0, 2);
     opt_showfps = ini_int("video", "ShowFPS", 0, 0, 1);
     opt_scale = ini_int("video", "Resolution", 0, 0, 4);
     opt_moviecolor = ini_int("video", "MovieColor", 1, 0, 1);
-    opt_moviefull = ini_int("video", "MovieFill", 1, 0, 1);
+    opt_moviedeblock = ini_int("video", "MovieDeblock", 1, 0, 1);
+    opt_moviedeband = ini_int("video", "MovieDeband", 1, 0, 1);
+    if (getenv(ENV("FILTER"))) opt_filter = atoi(getenv(ENV("FILTER")));
+    if (getenv(ENV("MOVIE"))) {   /* test switch: "cbd" letters = colour, deblock, deband on */
+        const char *m = getenv(ENV("MOVIE"));
+        opt_moviecolor = strchr(m, 'c') != NULL; opt_moviedeblock = strchr(m, 'b') != NULL; opt_moviedeband = strchr(m, 'd') != NULL;
+    }
     opt_render = ini_int("video", "RenderScale", 4, 1, 4);
     if (getenv(ENV("RENDER"))) opt_render = atoi(getenv(ENV("RENDER")));
     if (getenv(ENV("SCALE"))) opt_scale = atoi(getenv(ENV("SCALE"))) & 7;
@@ -506,25 +560,27 @@ static void settings_save(void)
     put("ShowFPS", opt_showfps);
     put("Resolution", opt_scale);
     put("MovieColor", opt_moviecolor);
-    put("MovieFill", opt_moviefull);
+    put("MovieDeblock", opt_moviedeblock);
+    put("MovieDeband", opt_moviedeband);
     put("RenderScale", opt_render);
 }
 
 /* ---------------- menu bar ---------------- */
 enum { ID_FILTER = 1000, ID_SHARP = 1010, ID_FXAA = 1020, ID_ASPECT = 1030, ID_WIN = 1040, ID_FULLSCREEN = 1050,
-       ID_SHOWFPS = 1051, ID_CONTROLS = 1060, ID_ABOUT = 1061, ID_SCALE = 1070, ID_MOVIECOLOR = 1080, ID_RENDER = 1090, ID_MOVIEFULL = 1081 };
+       ID_SHOWFPS = 1051, ID_CONTROLS = 1060, ID_ABOUT = 1061, ID_SCALE = 1070, ID_MOVIECOLOR = 1080, ID_RENDER = 1090, ID_MOVIEFULL = 1081, ID_MOVIEDEBLOCK = 1082, ID_MOVIEDEBAND = 1083 };
 static HMENU g_menu;
 static WINDOWPLACEMENT wpl = { sizeof wpl };
 
 static void update_checks(void)
 {
-    CheckMenuRadioItem(g_menu, ID_FILTER, ID_FILTER + 4, ID_FILTER + opt_filter, MF_BYCOMMAND);
+    CheckMenuRadioItem(g_menu, ID_FILTER, ID_FILTER + 5, ID_FILTER + opt_filter, MF_BYCOMMAND);
     CheckMenuRadioItem(g_menu, ID_SHARP, ID_SHARP + 3, ID_SHARP + opt_sharpen, MF_BYCOMMAND);
     CheckMenuRadioItem(g_menu, ID_ASPECT, ID_ASPECT + 2, ID_ASPECT + opt_aspect, MF_BYCOMMAND);
     CheckMenuRadioItem(g_menu, ID_SCALE, ID_SCALE + 4, ID_SCALE + opt_scale, MF_BYCOMMAND);
     CheckMenuItem(g_menu, ID_FXAA, MF_BYCOMMAND | (opt_fxaa ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(g_menu, ID_MOVIECOLOR, MF_BYCOMMAND | (opt_moviecolor ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuItem(g_menu, ID_MOVIEFULL, MF_BYCOMMAND | (opt_moviefull ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(g_menu, ID_MOVIEDEBLOCK, MF_BYCOMMAND | (opt_moviedeblock ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(g_menu, ID_MOVIEDEBAND, MF_BYCOMMAND | (opt_moviedeband ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuRadioItem(g_menu, ID_RENDER + 1, ID_RENDER + 4, ID_RENDER + opt_render, MF_BYCOMMAND);
     CheckMenuItem(g_menu, ID_FULLSCREEN, MF_BYCOMMAND | (opt_fullscreen ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(g_menu, ID_SHOWFPS, MF_BYCOMMAND | (opt_showfps ? MF_CHECKED : MF_UNCHECKED));
@@ -534,8 +590,9 @@ static HMENU build_menu(void)
 {
     HMENU bar = CreateMenu(), video = CreatePopupMenu(), asp = CreatePopupMenu(), filt = CreatePopupMenu(),
           sharp = CreatePopupMenu(), view = CreatePopupMenu(), winm = CreatePopupMenu(), help = CreatePopupMenu();
-    AppendMenuW(filt, MF_STRING, ID_FILTER + 2, L"Bicubic  (smooth and sharp - default)");
+    AppendMenuW(filt, MF_STRING, ID_FILTER + 5, L"Edge-adaptive  (FSR-style: sharp edges, no stair steps - default)");
     AppendMenuW(filt, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(filt, MF_STRING, ID_FILTER + 2, L"Bicubic  (smooth and sharp)");
     AppendMenuW(filt, MF_STRING, ID_FILTER + 0, L"Nearest  (sharp pixels)");
     AppendMenuW(filt, MF_STRING, ID_FILTER + 1, L"Bilinear  (smooth)");
     AppendMenuW(filt, MF_STRING, ID_FILTER + 3, L"Sharp bilinear  (crisp pixels, even sizes)");
@@ -565,9 +622,9 @@ static HMENU build_menu(void)
         AppendMenuW(rend, MF_STRING, ID_RENDER + s, t);
     }
     AppendMenuW(rend, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(rend, MF_STRING | MF_GRAYED, 0, L"The 3D of the away missions is drawn at this many times");
-    AppendMenuW(rend, MF_STRING | MF_GRAYED, 0, L"the original resolution (takes effect on the next mission)");
-    AppendMenuW(video, MF_POPUP, (UINT_PTR)rend, L"&Internal Resolution (3D)");
+    AppendMenuW(rend, MF_STRING | MF_GRAYED, 0, L"The 360-degree views are drawn at this many times");
+    AppendMenuW(rend, MF_STRING | MF_GRAYED, 0, L"the original resolution, with smooth filtering");
+    AppendMenuW(video, MF_POPUP, (UINT_PTR)rend, L"&Internal Resolution (panoramas)");
     AppendMenuW(video, MF_POPUP, (UINT_PTR)res, L"&Resolution");
     AppendMenuW(video, MF_POPUP, (UINT_PTR)asp, L"&Aspect Ratio");
     AppendMenuW(video, MF_POPUP, (UINT_PTR)filt, L"Upscale &Filter");
@@ -575,7 +632,8 @@ static HMENU build_menu(void)
     AppendMenuW(video, MF_POPUP, (UINT_PTR)sharp, L"&Sharpening (contrast adaptive)");
     AppendMenuW(video, MF_SEPARATOR, 0, NULL);
     AppendMenuW(video, MF_STRING, ID_MOVIECOLOR, L"&Movies in full colour  (24-bit, off = the game's 16-bit)");
-    AppendMenuW(video, MF_STRING, ID_MOVIEFULL, L"Movies &fill the screen  (off = the original letterbox in 4:3)");
+    AppendMenuW(video, MF_STRING, ID_MOVIEDEBLOCK, L"Movies: smooth compression &blocks");
+    AppendMenuW(video, MF_STRING, ID_MOVIEDEBAND, L"Movies: smooth colour ban&ding");
     for (int k = 1; k <= 3; k++) { wchar_t t[32]; swprintf(t, 32, L"%d x %d", 640 * k, 480 * k); AppendMenuW(winm, MF_STRING, ID_WIN + k, t); }
     AppendMenuW(view, MF_POPUP, (UINT_PTR)winm, L"&Window Size");
     AppendMenuW(view, MF_STRING, ID_FULLSCREEN, L"&Fullscreen\tAlt+Enter");
@@ -634,12 +692,13 @@ static const char *about_text =
 /* returns 1 if the command was ours */
 int present_menu_command(int id)
 {
-    if (id >= ID_FILTER && id <= ID_FILTER + 4) opt_filter = id - ID_FILTER;
+    if (id >= ID_FILTER && id <= ID_FILTER + 5) opt_filter = id - ID_FILTER;
     else if (id >= ID_SHARP && id <= ID_SHARP + 3) opt_sharpen = id - ID_SHARP;
     else if (id >= ID_ASPECT && id <= ID_ASPECT + 2) opt_aspect = id - ID_ASPECT;
     else if (id == ID_FXAA) opt_fxaa = !opt_fxaa;
     else if (id == ID_MOVIECOLOR) opt_moviecolor = !opt_moviecolor;
-    else if (id == ID_MOVIEFULL) opt_moviefull = !opt_moviefull;
+    else if (id == ID_MOVIEDEBLOCK) opt_moviedeblock = !opt_moviedeblock;
+    else if (id == ID_MOVIEDEBAND) opt_moviedeband = !opt_moviedeband;
     else if (id > ID_RENDER && id <= ID_RENDER + 4) opt_render = id - ID_RENDER;
     else if (id >= ID_SCALE && id <= ID_SCALE + 4) opt_scale = id - ID_SCALE;
     else if (id == ID_SHOWFPS) { opt_showfps = !opt_showfps; if (!opt_showfps) SetWindowTextA(hwnd, GAME_TITLE); }

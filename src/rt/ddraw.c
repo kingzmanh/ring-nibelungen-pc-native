@@ -74,8 +74,12 @@ static void present_now(void)
     if (!primary) return;
     if (primary->bpp == 16) {
         void pano_compose(u32 mem, int pitch);
-        pano_compose(primary->mem, primary->pitch);   /* hires_pano.c */
-        present_frame16(MEM + primary->mem, primary->pitch, primary->w, primary->h);
+        int movie_present(u32 mem, int pitch);
+        if (primary->w == 640 && primary->h == 480 && movie_present(primary->mem, primary->pitch)) hires_layer.valid = 0;   /* movie_hq.c */
+        else {
+            pano_compose(primary->mem, primary->pitch);   /* hires_pano.c */
+            present_frame16(MEM + primary->mem, primary->pitch, primary->w, primary->h);
+        }
     }
     else {
         hires_layer.valid = 0;

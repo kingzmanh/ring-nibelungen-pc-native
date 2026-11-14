@@ -20,3 +20,4 @@ testroot/
 prof.txt
 __pycache__/
 *.bin
+comparison/

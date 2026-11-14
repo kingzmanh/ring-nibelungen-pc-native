@@ -4,3 +4,5 @@
 # panorama internal resolution (src/rt/hires_pano.c)
 412220 N_pano_frame wrap
 4116d0 N_pano_block wrap
+# movies in full colour (src/rt/movie_hq.c)
+42c310 N_movie_decode wrap
