@@ -46,7 +46,7 @@ Movie deblocking / debanding, Window Size, Fullscreen.
 
 ## Status
 
-Work in progress (v0.1). Tested so far: intro, main menu, New Game, the opening cutscenes, the first
+Tested so far: intro, main menu, New Game, the opening cutscenes, the first
 360-degree view, installing and uninstalling.
 Not tested yet: saving and loading, the later chapters, the whole story.
 
