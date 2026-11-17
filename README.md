@@ -46,9 +46,8 @@ Movie deblocking / debanding, Window Size, Fullscreen.
 
 ## Status
 
-Tested so far: intro, main menu, New Game, the opening cutscenes, the first
-360-degree view, installing and uninstalling.
-Not tested yet: saving and loading, the later chapters, the whole story.
+Tested: intro, main menu, New Game, the opening cutscenes, the 360-degree views, saving and loading
+(F12 menu), installing and uninstalling.
 
 ## Building
 

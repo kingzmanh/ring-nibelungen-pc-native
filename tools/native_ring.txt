@@ -6,3 +6,5 @@
 4116d0 N_pano_block wrap
 # movies in full colour (src/rt/movie_hq.c)
 42c310 N_movie_decode wrap
+# Esc leaves the "key held" flag set, F12 menu ignored (src/rt/ring_game.c)
+40b070 N_key_char wrap
